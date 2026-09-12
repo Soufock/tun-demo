@@ -1,0 +1,24 @@
+README.md
+  h_f8a545b450e75d 38-41
+center/client/client.go
+  h_f8a545b450e75d 1-8,13,36-38,52-55,59-63,71-74,183,190,208,211,213-215
+center/gateway/gateway.go
+  h_f8a545b450e75d 1-8,12,136,139,141-143
+center/main.go
+  h_f8a545b450e75d 7-8,69-77,79
+center/relay/relay.go
+  h_f8a545b450e75d 1-8,14,16-18,22-352,390,394,407,415,480,482,497,502,508-537
+center/route/route.go
+  h_f8a545b450e75d 1-8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1fc94a9c780e2f1d2befd20e5418e6cf7ed8b2ef",
+  "prompts": {},
+  "humans": {
+    "h_f8a545b450e75d": {
+      "author": "Soulock <admin@5yweb.com>"
+    }
+  }
+}
