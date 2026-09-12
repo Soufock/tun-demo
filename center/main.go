@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+
+	"tun-demo/center/relay"
 )
 
 const (
@@ -64,7 +66,15 @@ func main() {
 
 	fmt.Println("Center UDP listen:", addr)
 
-	center := NewCenter(conn)
+	center := relay.NewCenter(
+		conn,
+		relay.Config{
+			AuthToken:      AuthToken,
+			VPNStart:       VPNStart,
+			VPNEnd:         VPNEnd,
+			FirstSessionID: FirstSessionID,
+		},
+	)
 
-	center.serve()
+	center.Serve()
 }

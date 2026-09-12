@@ -1,4 +1,11 @@
-package main
+// Package route 负责 Center 侧的路由表管理：
+//
+// 网段 -> Gateway 的映射，支持添加路由、
+// 按 Gateway 删除路由（Gateway 重复注册时清理旧路由）、
+// 按目的 IP 查找 Gateway。
+//
+// 纯数据管理，不做网络收发。
+package route
 
 import (
 	"net"

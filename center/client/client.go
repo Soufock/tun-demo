@@ -1,12 +1,18 @@
-package main
+// Package client 负责 Center 侧 Client Session 的生命周期管理：
+//
+// 认证后的 Session 注册、SessionID / VPN IP 分配（地址池去重）、
+// 按 ID / VPN IP / UDP 来源地址三种索引的查找，
+// 以及 NAT 端口变化时的地址更新。
+//
+// 纯数据管理，不做网络收发。
+package client
 
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"time"
-
-	"tun-demo/protocol"
 )
 
 // ============================================================
@@ -27,9 +33,9 @@ type ClientSession struct {
 // 管理 Client Session 和 VPN IP 地址池，
 // 内部持有三份索引：
 //
-//     byID   - SessionID -> Session
-//     byIP   - VPN IP   -> Session
-//     byAddr - "ip:port" -> Session（按来源地址 O(1) 匹配）
+//     byID   - SessionID  -> Session
+//     byIP   - VPN IP     -> Session
+//     byAddr - "ip:port"  -> Session（按来源地址 O(1) 匹配）
 //
 // ============================================================
 
@@ -43,10 +49,18 @@ type ClientManager struct {
 	// 已经分配的 VPN IP
 	allocated map[string]bool
 
+	// VPN IP 地址池范围：10.10.0.[vpnStart] - 10.10.0.[vpnEnd]
+	vpnStart int
+	vpnEnd   int
+
 	nextSessionID uint32
 }
 
-func NewClientManager() *ClientManager {
+func NewClientManager(
+	vpnStart int,
+	vpnEnd int,
+	firstSessionID uint32,
+) *ClientManager {
 
 	return &ClientManager{
 		byID:      make(map[uint32]*ClientSession),
@@ -54,7 +68,10 @@ func NewClientManager() *ClientManager {
 		byAddr:    make(map[string]*ClientSession),
 		allocated: make(map[string]bool),
 
-		nextSessionID: FirstSessionID,
+		vpnStart: vpnStart,
+		vpnEnd:   vpnEnd,
+
+		nextSessionID: firstSessionID,
 	}
 }
 
@@ -163,14 +180,14 @@ func (m *ClientManager) UpdateAddr(
 // ============================================================
 // 分配 VPN IP
 //
-// 10.10.0.10 - 10.10.0.254，allocated map 去重
+// 10.10.0.[vpnStart] - 10.10.0.[vpnEnd]，allocated map 去重
 //
 // 调用方必须持有 m.mu
 // ============================================================
 
 func (m *ClientManager) allocateVPNIP() net.IP {
 
-	for i := VPNStart; i <= VPNEnd; i++ {
+	for i := m.vpnStart; i <= m.vpnEnd; i++ {
 
 		ip := net.IPv4(
 			10,
@@ -188,75 +205,13 @@ func (m *ClientManager) allocateVPNIP() net.IP {
 }
 
 // ============================================================
-// Client AUTH
-//
-// 校验 Token，分配 SessionID 和 VPN IP
+// UDP 地址索引 key："ip:port"
 // ============================================================
 
-func (c *Center) handleClientAuth(
-	addr *net.UDPAddr,
-	payload []byte,
-) {
+func addrKey(addr *net.UDPAddr) string {
 
-	token := string(payload)
-
-	// 简单鉴权
-	if token != AuthToken {
-
-		fmt.Printf(
-			"client auth failed: addr=%s\n",
-			addr,
-		)
-
-		c.reply(
-			addr,
-			protocol.TypeAuthFail,
-			0,
-			[]byte("invalid token"),
-		)
-
-		return
-	}
-
-	// ============================================================
-	// 分配 Session 和 VPN IP
-	// ============================================================
-
-	session, err := c.clients.Authenticate(addr)
-
-	if err != nil {
-
-		fmt.Printf(
-			"client auth failed: addr=%s reason=%v\n",
-			addr,
-			err,
-		)
-
-		c.reply(
-			addr,
-			protocol.TypeAuthFail,
-			0,
-			[]byte(err.Error()),
-		)
-
-		return
-	}
-
-	fmt.Printf(
-		"client authenticated: session=%d vpn_ip=%s addr=%s\n",
-		session.ID,
-		session.VPNIP,
-		addr,
-	)
-
-	// ============================================================
-	// AUTH_OK payload：4 字节 VPN IPv4
-	// ============================================================
-
-	c.reply(
-		addr,
-		protocol.TypeAuthOK,
-		session.ID,
-		session.VPNIP.To4(),
+	return net.JoinHostPort(
+		addr.IP.String(),
+		strconv.Itoa(addr.Port),
 	)
 }

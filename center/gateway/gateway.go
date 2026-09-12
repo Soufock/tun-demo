@@ -1,12 +1,17 @@
-package main
+// Package gateway 负责 Center 侧 Gateway 的注册管理：
+//
+// 注册（同 ID 重复注册时返回旧实例以便清理旧路由）、
+// 按 ID / UDP 来源地址双索引查找，
+// 以及 NAT 端口变化时的地址更新。
+//
+// 纯数据管理，不做网络收发。
+package gateway
 
 import (
-	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"time"
-
-	"tun-demo/protocol"
 )
 
 // ============================================================
@@ -128,132 +133,13 @@ func (m *GatewayManager) UpdateAddr(
 }
 
 // ============================================================
-// Gateway AUTH
-//
-// 校验 Token，保存 Gateway，并为每个 network 自动建立路由
+// UDP 地址索引 key："ip:port"
 // ============================================================
 
-func (c *Center) handleGatewayAuth(
-	addr *net.UDPAddr,
-	payload []byte,
-) {
+func addrKey(addr *net.UDPAddr) string {
 
-	auth, err := protocol.UnmarshalGatewayAuth(payload)
-	if err != nil {
-
-		fmt.Printf(
-			"gateway auth failed: addr=%s reason=%v\n",
-			addr,
-			err,
-		)
-
-		c.reply(
-			addr,
-			protocol.TypeGatewayAuthFail,
-			0,
-			[]byte("invalid gateway auth"),
-		)
-
-		return
-	}
-
-	if auth.Token != AuthToken {
-
-		fmt.Printf(
-			"gateway auth failed: addr=%s id=%s reason=invalid token\n",
-			addr,
-			auth.GatewayID,
-		)
-
-		c.reply(
-			addr,
-			protocol.TypeGatewayAuthFail,
-			0,
-			[]byte("invalid token"),
-		)
-
-		return
-	}
-
-	// ============================================================
-	// 解析内网网段
-	// ============================================================
-
-	var networks []*net.IPNet
-
-	for _, s := range auth.Networks {
-
-		_, ipNet, err := net.ParseCIDR(s)
-		if err != nil {
-
-			fmt.Printf(
-				"gateway auth failed: addr=%s id=%s reason=invalid network %q\n",
-				addr,
-				auth.GatewayID,
-				s,
-			)
-
-			c.reply(
-				addr,
-				protocol.TypeGatewayAuthFail,
-				0,
-				[]byte("invalid network: "+s),
-			)
-
-			return
-		}
-
-		networks = append(
-			networks,
-			ipNet,
-		)
-	}
-
-	// ============================================================
-	// 保存 Gateway
-	// ============================================================
-
-	gateway := &Gateway{
-		ID:       auth.GatewayID,
-		Addr:     addr,
-		Networks: networks,
-		LastSeen: time.Now(),
-	}
-
-	old := c.gateways.Register(gateway)
-
-	fmt.Printf(
-		"gateway authenticated: id=%s addr=%s\n",
-		gateway.ID,
-		addr,
-	)
-
-	// ============================================================
-	// 重复注册：先删除旧路由，再建立新路由，避免重复
-	// ============================================================
-
-	if old != nil {
-		c.routes.DeleteByGateway(gateway.ID)
-	}
-
-	for _, ipNet := range networks {
-
-		c.routes.Add(
-			ipNet,
-			gateway.ID,
-		)
-
-		fmt.Printf(
-			"route added: %s -> %s\n",
-			ipNet,
-			gateway.ID,
-		)
-	}
-
-	c.reply(
-		addr,
-		protocol.TypeGatewayAuthOK,
-		0,
-		nil,
+	return net.JoinHostPort(
+		addr.IP.String(),
+		strconv.Itoa(addr.Port),
 	)
 }

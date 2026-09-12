@@ -35,11 +35,10 @@
 ├── client/     # VPN 客户端（macOS）
 ├── center/     # 中继服务器（公网，纯 UDP，不创建 TUN）
 │   ├── main.go    # 配置与入口
-│   ├── center.go  # 主循环、按包类型分发
-│   ├── client.go  # ClientManager：Client 认证、Session、VPN IP 地址池
-│   ├── gateway.go # GatewayManager：Gateway 注册与查找
-│   ├── route.go   # RouteTable：网段 -> Gateway 路由
-│   └── forward.go # IP 包双向转发
+│   ├── client/    # ClientManager：Client 认证、Session、VPN IP 地址池
+│   ├── gateway/   # GatewayManager：Gateway 注册与查找
+│   ├── route/     # RouteTable：网段 -> Gateway 路由
+│   └── relay/     # Center：收包分发、认证处理、IP 双向转发
 └── gateway/    # 内网网关（Linux，TUN + 路由）
 ```
 
