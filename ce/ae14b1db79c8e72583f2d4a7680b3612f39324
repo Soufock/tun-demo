@@ -1,0 +1,32 @@
+README.md
+  h_f8a545b450e75d 35-40,46-50,53-62,109,111,119,129,139-146
+client/main.go
+  h_f8a545b450e75d 525-547
+client/tun_darwin.go
+  h_f8a545b450e75d 1-157
+client/tun_linux.go
+  h_f8a545b450e75d 1-135
+client/tun_windows.go
+  h_f8a545b450e75d 1-142
+gateway/main.go
+  h_f8a545b450e75d 435,437,439-447
+gateway/tun_darwin.go
+  h_f8a545b450e75d 1-78
+gateway/tun_linux.go
+  h_f8a545b450e75d 1-76
+gateway/tun_windows.go
+  h_f8a545b450e75d 1-56
+go.mod
+  h_f8a545b450e75d 5-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ceae14b1db79c8e72583f2d4a7680b3612f39324",
+  "prompts": {},
+  "humans": {
+    "h_f8a545b450e75d": {
+      "author": "Soulock <admin@5yweb.com>"
+    }
+  }
+}
