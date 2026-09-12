@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/songgao/water"
 )
@@ -15,18 +16,82 @@ import (
 const (
 	Magic      = "VTUN"
 	Version    = 1
-	TypeIP     = 1
-	HeaderSize = 8
+	HeaderSize = 16
+	MaxPacket  = 65535
 
+	TypeAuth     = 1
+	TypeAuthOK   = 2
+	TypeAuthFail = 3
+	TypeIP       = 4
+
+	// Server TUN
 	TUNIP   = "10.10.0.2"
-	TUNPeer = "10.10.0.1"
-	TUNMask = "30"
+	TUNMask = "24"
+
+	// VPN IP 地址池
+	VPNNetwork = "10.10.0.0/24"
+	VPNStart   = 10
+	VPNEnd     = 254
+
+	// 简单鉴权 token
+	// 后面可以替换成真正的 JWT / API Key / 用户系统
+	AuthToken = "123456"
+
+	// UDP
+	ListenAddr = ":19000"
 )
 
+// ============================================================
+// Header
+// ============================================================
+
+type Header struct {
+	Magic     [4]byte
+	Version   uint8
+	Type      uint8
+	Length    uint16
+	SessionID uint32
+	Sequence  uint32
+}
+
+// ============================================================
+// Session
+// ============================================================
+
+type Session struct {
+	ID       uint32
+	VPNIP    net.IP
+	Client   *net.UDPAddr
+	LastSeen time.Time
+}
+
+// ============================================================
+// Server
+// ============================================================
+
+type VPNServer struct {
+	tun  *water.Interface
+	conn *net.UDPConn
+
+	mu sync.RWMutex
+
+	// SessionID -> Session
+	sessions map[uint32]*Session
+
+	// VPN IP -> Session
+	sessionsByIP map[string]*Session
+
+	// 已经分配的 VPN IP
+	allocated map[string]bool
+
+	nextSessionID uint32
+}
+
 func main() {
-	// =========================
+	// ========================================================
 	// 1. 创建 TUN
-	// =========================
+	// ========================================================
+
 	config := water.Config{
 		DeviceType: water.TUN,
 	}
@@ -35,20 +100,23 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer tun.Close()
 
 	fmt.Println("TUN:", tun.Name())
 
-	// =========================
-	// 2. 自动配置 TUN IP
-	// =========================
+	// ========================================================
+	// 2. 配置 TUN
+	// ========================================================
+
 	if err := configureTUN(tun.Name()); err != nil {
 		log.Fatal(err)
 	}
 
-	// =========================
+	// ========================================================
 	// 3. UDP
-	// =========================
-	addr, err := net.ResolveUDPAddr("udp", ":19000")
+	// ========================================================
+
+	addr, err := net.ResolveUDPAddr("udp", ListenAddr)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -61,96 +129,325 @@ func main() {
 
 	fmt.Println("UDP listen:", addr)
 
-	// 保存客户端 UDP 地址
-	var (
-		clientAddr *net.UDPAddr
-		mu         sync.RWMutex
-	)
+	server := &VPNServer{
+		tun:  tun,
+		conn: conn,
 
-	// =========================
+		sessions:     make(map[uint32]*Session),
+		sessionsByIP: make(map[string]*Session),
+		allocated:    make(map[string]bool),
+
+		nextSessionID: 10000,
+	}
+
+	// ========================================================
 	// 4. TUN -> UDP
-	// =========================
-	go func() {
-		buf := make([]byte, 65535)
+	// ========================================================
 
-		for {
-			n, err := tun.Read(buf)
-			if err != nil {
-				log.Println("TUN read error:", err)
-				continue
-			}
+	go server.tunToUDP()
 
-			packet := buf[:n]
-
-			mu.RLock()
-			dst := clientAddr
-			mu.RUnlock()
-
-			if dst == nil {
-				log.Println("TUN -> UDP: no client")
-				continue
-			}
-
-			vpnPacket := pack(packet)
-
-			_, err = conn.WriteToUDP(vpnPacket, dst)
-			if err != nil {
-				log.Println("UDP send error:", err)
-				continue
-			}
-
-			fmt.Printf(
-				"TUN -> UDP: %d bytes -> %s\n",
-				n,
-				dst,
-			)
-		}
-	}()
-
-	// =========================
+	// ========================================================
 	// 5. UDP -> TUN
-	// =========================
-	buf := make([]byte, 65535)
+	// ========================================================
+
+	server.udpToTun()
+}
+
+// ============================================================
+// TUN -> UDP
+// ============================================================
+
+func (s *VPNServer) tunToUDP() {
+	buf := make([]byte, MaxPacket)
 
 	for {
-		n, addr, err := conn.ReadFromUDP(buf)
+		n, err := s.tun.Read(buf)
+		if err != nil {
+			log.Println("TUN read error:", err)
+			continue
+		}
+
+		packet := append([]byte(nil), buf[:n]...)
+
+		if len(packet) < 20 {
+			log.Println("TUN packet too small")
+			continue
+		}
+
+		// IPv4 dst
+		dstIP := net.IP(packet[16:20]).String()
+
+		s.mu.RLock()
+		session := s.sessionsByIP[dstIP]
+		s.mu.RUnlock()
+
+		if session == nil {
+			log.Println("TUN -> UDP: no session for", dstIP)
+			continue
+		}
+
+		vpnPacket := pack(
+			TypeIP,
+			session.ID,
+			0,
+			packet,
+		)
+
+		_, err = s.conn.WriteToUDP(
+			vpnPacket,
+			session.Client,
+		)
+		if err != nil {
+			log.Println("UDP send error:", err)
+			continue
+		}
+
+		fmt.Printf(
+			"TUN -> UDP: %s -> %s session=%d client=%s\n",
+			net.IP(packet[12:16]),
+			net.IP(packet[16:20]),
+			session.ID,
+			session.Client,
+		)
+	}
+}
+
+// ============================================================
+// UDP -> TUN
+// ============================================================
+
+func (s *VPNServer) udpToTun() {
+	buf := make([]byte, MaxPacket+HeaderSize)
+
+	for {
+		n, addr, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
 			log.Println("UDP read error:", err)
 			continue
 		}
 
-		// 记住客户端地址
-		mu.Lock()
-		clientAddr = addr
-		mu.Unlock()
-
-		fmt.Printf(
-			"UDP <- %s: %d bytes\n",
-			addr,
-			n,
-		)
-
-		packet, err := unpack(buf[:n])
+		header, payload, err := unpack(buf[:n])
 		if err != nil {
 			log.Println("invalid VPN packet:", err)
 			continue
 		}
 
-		fmt.Printf(
-			"UDP -> TUN: %d bytes\n",
-			len(packet),
-		)
+		switch header.Type {
 
-		_, err = tun.Write(packet)
-		if err != nil {
-			log.Println("TUN write error:", err)
+		case TypeAuth:
+
+			s.handleAuth(addr, header, payload)
+
+		case TypeIP:
+
+			s.handleIP(addr, header, payload)
+
+		default:
+
+			log.Println("unsupported packet type:", header.Type)
 		}
 	}
 }
 
-// configureTUN 自动配置 TUN IP
+// ============================================================
+// AUTH
+// ============================================================
+
+func (s *VPNServer) handleAuth(
+	addr *net.UDPAddr,
+	header *Header,
+	payload []byte,
+) {
+	token := string(payload)
+
+	fmt.Printf(
+		"AUTH <- %s token=%s\n",
+		addr,
+		token,
+	)
+
+	// 简单鉴权
+	if token != AuthToken {
+
+		fmt.Println("AUTH failed:", addr)
+
+		response := pack(
+			TypeAuthFail,
+			0,
+			0,
+			[]byte("invalid token"),
+		)
+
+		_, err := s.conn.WriteToUDP(
+			response,
+			addr,
+		)
+		if err != nil {
+			log.Println("AUTH_FAIL send error:", err)
+		}
+
+		return
+	}
+
+	// ========================================================
+	// 分配 Session
+	// ========================================================
+
+	s.mu.Lock()
+
+	sessionID := s.nextSessionID
+	s.nextSessionID++
+
+	vpnIP := s.allocateVPNIP()
+
+	if vpnIP == nil {
+		s.mu.Unlock()
+
+		response := pack(
+			TypeAuthFail,
+			0,
+			0,
+			[]byte("no VPN IP available"),
+		)
+
+		_, _ = s.conn.WriteToUDP(
+			response,
+			addr,
+		)
+
+		return
+	}
+
+	session := &Session{
+		ID:       sessionID,
+		VPNIP:    vpnIP,
+		Client:   addr,
+		LastSeen: time.Now(),
+	}
+
+	s.sessions[sessionID] = session
+	s.sessionsByIP[vpnIP.String()] = session
+	s.allocated[vpnIP.String()] = true
+
+	s.mu.Unlock()
+
+	fmt.Printf(
+		"AUTH OK: client=%s session=%d vpnIP=%s\n",
+		addr,
+		sessionID,
+		vpnIP,
+	)
+
+	// ========================================================
+	// AUTH_OK payload
+	//
+	// 4 bytes VPN IP
+	// ========================================================
+
+	payload = make([]byte, 4)
+	copy(payload, vpnIP.To4())
+
+	response := pack(
+		TypeAuthOK,
+		sessionID,
+		0,
+		payload,
+	)
+
+	_, err := s.conn.WriteToUDP(
+		response,
+		addr,
+	)
+	if err != nil {
+		log.Println("AUTH_OK send error:", err)
+	}
+}
+
+// ============================================================
+// IP 数据包
+// ============================================================
+
+func (s *VPNServer) handleIP(
+	addr *net.UDPAddr,
+	header *Header,
+	packet []byte,
+) {
+	s.mu.Lock()
+
+	session := s.sessions[header.SessionID]
+
+	if session == nil {
+		s.mu.Unlock()
+
+		log.Printf(
+			"unknown session=%d from=%s\n",
+			header.SessionID,
+			addr,
+		)
+
+		return
+	}
+
+	// 更新 UDP 地址
+	//
+	// 这样客户端 UDP 源端口变化也可以继续使用
+	session.Client = addr
+	session.LastSeen = time.Now()
+
+	s.mu.Unlock()
+
+	if len(packet) < 20 {
+		log.Println("IP packet too small")
+		return
+	}
+
+	srcIP := net.IP(packet[12:16])
+	dstIP := net.IP(packet[16:20])
+
+	fmt.Printf(
+		"UDP -> TUN: session=%d %s -> %s\n",
+		header.SessionID,
+		srcIP,
+		dstIP,
+	)
+
+	_, err := s.tun.Write(packet)
+	if err != nil {
+		log.Println("TUN write error:", err)
+	}
+}
+
+// ============================================================
+// 分配 VPN IP
+// ============================================================
+
+func (s *VPNServer) allocateVPNIP() net.IP {
+	for i := VPNStart; i <= VPNEnd; i++ {
+
+		ip := net.IPv4(
+			10,
+			10,
+			0,
+			byte(i),
+		).To4()
+
+		key := ip.String()
+
+		if !s.allocated[key] {
+			return ip
+		}
+	}
+
+	return nil
+}
+
+// ============================================================
+// TUN 配置
+// ============================================================
+
 func configureTUN(name string) error {
-	// 先删除可能存在的旧配置
+
+	// 删除旧配置
 	_ = exec.Command(
 		"ip",
 		"addr",
@@ -159,13 +456,7 @@ func configureTUN(name string) error {
 		name,
 	).Run()
 
-	// 配置：
-	//
-	// 10.10.0.2/30
-	//
-	// 对端：
-	// 10.10.0.1
-	//
+	// 10.10.0.2/24
 	cmd := exec.Command(
 		"ip",
 		"addr",
@@ -184,7 +475,7 @@ func configureTUN(name string) error {
 		)
 	}
 
-	// 启动 TUN
+	// UP
 	cmd = exec.Command(
 		"ip",
 		"link",
@@ -204,8 +495,7 @@ func configureTUN(name string) error {
 	}
 
 	fmt.Printf(
-		"TUN configured: %s -> %s/%s\n",
-		name,
+		"TUN configured: %s/%s\n",
 		TUNIP,
 		TUNMask,
 	)
@@ -213,54 +503,97 @@ func configureTUN(name string) error {
 	return nil
 }
 
-// pack:
-// VTUN header + IP packet
-func pack(packet []byte) []byte {
-	vpnPacket := make([]byte, HeaderSize+len(packet))
+// ============================================================
+// Pack
+// ============================================================
 
-	copy(vpnPacket[0:4], Magic)
+func pack(
+	packetType uint8,
+	sessionID uint32,
+	sequence uint32,
+	payload []byte,
+) []byte {
 
-	vpnPacket[4] = Version
-	vpnPacket[5] = TypeIP
+	data := make([]byte, HeaderSize+len(payload))
 
-	binary.BigEndian.PutUint16(
-		vpnPacket[6:8],
-		uint16(len(packet)),
+	copy(
+		data[0:4],
+		Magic,
 	)
 
-	copy(vpnPacket[8:], packet)
+	data[4] = Version
+	data[5] = packetType
 
-	return vpnPacket
+	binary.BigEndian.PutUint16(
+		data[6:8],
+		uint16(len(payload)),
+	)
+
+	binary.BigEndian.PutUint32(
+		data[8:12],
+		sessionID,
+	)
+
+	binary.BigEndian.PutUint32(
+		data[12:16],
+		sequence,
+	)
+
+	copy(
+		data[HeaderSize:],
+		payload,
+	)
+
+	return data
 }
 
-// unpack:
-// VTUN header -> IP packet
-func unpack(data []byte) ([]byte, error) {
+// ============================================================
+// Unpack
+// ============================================================
+
+func unpack(data []byte) (
+	*Header,
+	[]byte,
+	error,
+) {
+
 	if len(data) < HeaderSize {
-		return nil, fmt.Errorf("packet too short")
+		return nil, nil, fmt.Errorf(
+			"packet too short",
+		)
 	}
 
 	if string(data[0:4]) != Magic {
-		return nil, fmt.Errorf("invalid magic")
+		return nil, nil, fmt.Errorf(
+			"invalid magic",
+		)
 	}
 
 	if data[4] != Version {
-		return nil, fmt.Errorf("invalid version")
+		return nil, nil, fmt.Errorf(
+			"invalid version",
+		)
 	}
 
-	if data[5] != TypeIP {
-		return nil, fmt.Errorf("invalid type")
+	header := &Header{
+		Version:   data[4],
+		Type:      data[5],
+		Length:    binary.BigEndian.Uint16(data[6:8]),
+		SessionID: binary.BigEndian.Uint32(data[8:12]),
+		Sequence:  binary.BigEndian.Uint32(data[12:16]),
 	}
 
-	length := int(binary.BigEndian.Uint16(data[6:8]))
+	length := int(header.Length)
 
 	if len(data) < HeaderSize+length {
-		return nil, fmt.Errorf(
-			"invalid length: header=%d payload=%d",
+		return nil, nil, fmt.Errorf(
+			"invalid length: packet=%d payload=%d",
 			len(data),
 			length,
 		)
 	}
 
-	return data[HeaderSize : HeaderSize+length], nil
+	payload := data[HeaderSize : HeaderSize+length]
+
+	return header, payload, nil
 }
