@@ -1,79 +1,109 @@
 # tun-demo
 
-一个基于 TUN 设备的极简 VPN 演示项目（v2），通过 UDP 将 IP 包封装后在客户端与服务器之间转发，支持 Token 鉴权、多客户端 Session 管理和 VPN IP 动态分配。
+一个基于 Go + TUN + UDP 的三段式 VPN 演示项目（v3）。
+
+```text
+                         Internet
+                            │
+                            │ UDP
+                            ▼
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│    Client    │ UDP  │    Center    │ UDP  │   Gateway    │
+│              │◄────►│              │◄────►│              │
+│ Mac/Windows  │      │ 公网服务器    │      │ 公司内网机器  │
+│ Linux        │      │ 纯转发        │      │ TUN + 路由   │
+│ TUN          │      │ 不创建 TUN    │      │              │
+└──────────────┘      └──────────────┘      └──────┬───────┘
+                                                   │
+                                            公司内部网络
+```
+
+完整设计文档见 [v3方案.md](v3方案.md)。
+
+## 核心设计
+
+- **Client 不直接连接 Gateway**，所有流量经过 Center 中继
+- **Gateway 不需要公网 IP**，主动连接 Center，NAT 端口变化也能自动适应
+- **Center 不创建 TUN**、不进入公司内网，只做 VPN 数据包中继和路由
+- **Gateway** 负责把 VPN 流量送入公司内网
+- 第一阶段使用唯一 VPN IP，不实现 NAT
 
 ## 项目结构
 
 ```
-├── client/   # VPN 客户端（macOS）
-└── server/   # VPN 服务器（Linux）
+├── protocol/   # 三端共用的 VPN 协议（Pack/Unpack/包类型）
+├── client/     # VPN 客户端（macOS）
+├── center/     # 中继服务器（公网，纯 UDP，不创建 TUN）
+└── gateway/    # 内网网关（Linux，TUN + 路由）
 ```
-
-两端都使用 [songgao/water](https://github.com/songgao/water) 创建 TUN 虚拟网卡，通过自定义协议把原始 IP 包封装进 UDP 报文传输。
-
-## v2 相比 v1 的变化
-
-- 协议头部从 8 字节扩展为 16 字节，新增 **SessionID** 和 **Sequence** 字段
-- 新增**鉴权握手**：客户端先用 Token 认证，成功后才进入数据传输
-- 服务器支持**多客户端**：按 SessionID 管理会话，从地址池动态分配 VPN IP
-- 客户端 VPN IP 不再硬编码，由服务器在 AUTH_OK 中下发
 
 ## 自定义协议
 
 每个 UDP 报文携带一个 16 字节头部（全部大端）：
 
-| 偏移 | 长度 | 字段      | 说明                 |
-| ---- | ---- | --------- | -------------------- |
-| 0    | 4    | Magic     | 固定为 `VTUN`        |
-| 4    | 1    | Version   | 协议版本，当前为 `1` |
-| 5    | 1    | Type      | 包类型（见下表）     |
-| 6    | 2    | Length    | Payload 长度         |
-| 8    | 4    | SessionID | 会话 ID（鉴权时分配）|
-| 12   | 4    | Sequence  | 序列号（预留）       |
-| 16   | N    | Payload   | 载荷                 |
+| 偏移 | 长度 | 字段      | 说明                  |
+| ---- | ---- | --------- | --------------------- |
+| 0    | 4    | Magic     | 固定为 `VTUN`         |
+| 4    | 1    | Version   | 协议版本，当前为 `1`  |
+| 5    | 1    | Type      | 包类型（见下表）      |
+| 6    | 2    | Length    | Payload 长度          |
+| 8    | 4    | SessionID | 会话 ID（鉴权时分配） |
+| 12   | 4    | Sequence  | 序列号（预留）        |
+| 16   | N    | Payload   | 载荷                  |
 
 ### 包类型
 
-| Type | 名称      | 方向           | Payload           |
-| ---- | --------- | -------------- | ----------------- |
-| 1    | AUTH      | client→server  | Token 字符串      |
-| 2    | AUTH_OK   | server→client  | 4 字节 VPN IPv4   |
-| 3    | AUTH_FAIL | server→client  | 失败原因字符串    |
-| 4    | IP        | 双向           | 原始 IP 数据包    |
+| Type | 名称              | 方向             | Payload                          |
+| ---- | ----------------- | ---------------- | -------------------------------- |
+| 1    | AUTH              | client→center    | Token 字符串                     |
+| 2    | AUTH_OK           | center→client    | 4 字节 VPN IPv4                  |
+| 3    | AUTH_FAIL         | center→client    | 失败原因                         |
+| 4    | GATEWAY_AUTH      | gateway→center   | JSON（gateway_id/token/networks）|
+| 5    | GATEWAY_AUTH_OK   | center→gateway   | 空                               |
+| 6    | GATEWAY_AUTH_FAIL | center→gateway   | 失败原因                         |
+| 7    | IP                | 双向             | 原始 IP 数据包                   |
+| 8/9  | HEARTBEAT / OK    | 预留（第二阶段） | -                                |
 
-### 握手流程
+### 工作流程
 
-1. 客户端发送 `AUTH`（携带 Token）
-2. 服务器校验 Token，失败则回复 `AUTH_FAIL`
-3. 成功后服务器分配 SessionID 和 VPN IP，回复 `AUTH_OK`
-4. 之后双方用 `TypeIP` 包传输数据，所有 IP 包携带 SessionID
+1. **Gateway 注册**：主动连接 Center，发送 GATEWAY_AUTH（携带内网网段），Center 自动建立 `网段 -> Gateway` 路由
+2. **Client 认证**：发送 AUTH，Center 分配 SessionID 和 VPN IP（地址池 10.10.0.10–254）
+3. **Client → 内网**：Center 按目的 IP 匹配路由，转发到对应 Gateway，写入 TUN 进入内网
+4. **内网 → Client**：Gateway TUN 收到回程包发给 Center，Center 按目的 VPN IP 找到 Client Session 转发
 
 ## 地址规划
 
-| 角色   | 地址            | 说明                           |
-| ------ | --------------- | ------------------------------ |
-| server | 10.10.0.2/24    | 服务器 TUN 地址                |
-| client | 10.10.0.10–254  | 由服务器从地址池动态分配       |
+| 角色   | 地址                   | 说明                     |
+| ------ | ---------------------- | ------------------------ |
+| center | 103.217.197.174:19000  | 公网 UDP，不占用 VPN IP  |
+| gateway| 10.10.0.2/24           | Gateway TUN 地址         |
+| client | 10.10.0.10–254         | 由 Center 动态分配       |
 
-客户端需要走 VPN 的网段默认为 `10.88.0.0/24`（`client/main.go` 中的 `VPNNetwork`），服务器 UDP 监听 `:19000`。
-
-鉴权 Token 目前为硬编码的固定字符串（两端 `AuthToken` 常量，默认 `123456`），后续可替换为 JWT / API Key。
+Center 地址、Token、Gateway 网段等均为各端 `main.go` 顶部的常量，部署时按实际情况修改。
 
 ## 运行
 
-两端都需要 root 权限（创建 TUN 设备、配置 IP 和路由）。
+三端都需要 root 权限（Center 除外，它不创建 TUN）。
 
-### 服务器（Linux）
+### Center（公网服务器）
 
 ```bash
-cd server
-go build -o server .
-sudo ./server
+cd center
+go build -o center .
+./center
 ```
 
-启动后自动创建 TUN 设备并配置 `10.10.0.2/24`，监听 UDP 19000 端口，等待客户端鉴权接入。
+### Gateway（公司内网 Linux 机器）
 
-### 客户端（macOS）
+```bash
+cd gateway
+go build -o gateway .
+sudo ./gateway
+```
+
+启动后自动创建 TUN（10.10.0.2/24）并向 Center 注册内网网段。注意公司内网需要有回程路由：`10.10.0.0/24 via <Gateway 内网 IP>`。
+
+### Client（macOS）
 
 ```bash
 cd client
@@ -81,8 +111,14 @@ go build -o tun-demo .
 sudo ./tun-demo
 ```
 
-启动后自动创建 TUN 设备、向服务器鉴权获取 VPN IP、配置 TUN 和路由，之后访问 `VPNNetwork` 网段的流量即会通过 VPN 隧道转发。
+启动后自动创建 TUN、认证获取 VPN IP、配置路由，之后访问公司网段（默认 `192.168.0.0/24`）的流量即通过 `Client → Center → Gateway` 隧道转发。
 
-## 注意
+## 测试
 
-服务器地址硬编码在 `client/main.go` 的 `ServerAddr` 常量中，部署时按实际情况修改。
+```bash
+go test ./protocol/
+```
+
+## 第一阶段不包含
+
+NAT、心跳与 Session 清理、多租户相同 VPN IP、ACL、Web 管理后台、数据库等（见设计文档第 34 节）。

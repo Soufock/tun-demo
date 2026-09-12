@@ -22,43 +22,22 @@ const (
 	// 部署时修改为真实的 Center 公网地址
 	CenterAddr = "103.217.197.174:19000"
 
-	// 鉴权 Token
-	//
-	// 现在先简单使用固定 Token。
-	// 后面可以换成真正的用户 Token / JWT / API Key。
+	// ============================================================
+	// Gateway 注册信息
+	// ============================================================
+
+	GatewayID = "company-a"
 	AuthToken = "123456"
 
+	// 本 Gateway 接入的公司内网网段
+	Networks = "192.168.0.0/24"
+
 	// ============================================================
-	// VPN
+	// TUN
 	// ============================================================
 
-	// Gateway 的 TUN 虚拟地址
-	//
-	// 作为 macOS 点对点 TUN 的对端地址和路由下一跳：
-	//
-	//     10.10.0.2
-	//
-	GatewayIP = "10.10.0.2"
-
-	// 需要通过 VPN 访问的公司网段
-	//
-	// 例如：
-	//
-	// 192.168.0.0/24
-	//
-	VPNNetwork = "192.168.0.0/24"
-)
-
-// ============================================================
-// 动态获取的 Session 信息
-// ============================================================
-
-var (
-	// Center 分配
-	SessionID uint32
-
-	// Center 分配
-	ClientIP string
+	TUNIP   = "10.10.0.2"
+	TUNMask = "24"
 )
 
 func main() {
@@ -81,7 +60,15 @@ func main() {
 	fmt.Println("TUN:", tun.Name())
 
 	// ============================================================
-	// 2. 连接 Center
+	// 2. 配置 TUN
+	// ============================================================
+
+	if err := configureTUN(tun.Name()); err != nil {
+		log.Fatal(err)
+	}
+
+	// ============================================================
+	// 3. 连接 Center
 	// ============================================================
 
 	centerAddr, err := net.ResolveUDPAddr(
@@ -109,38 +96,15 @@ func main() {
 	)
 
 	// ============================================================
-	// 3. AUTH
+	// 4. GATEWAY AUTH
 	// ============================================================
 
 	if err := authenticate(conn); err != nil {
-		log.Fatal("authentication failed:", err)
+		log.Fatal("gateway authentication failed:", err)
 	}
 
 	// ============================================================
-	// 4. 自动配置 TUN
-	// ============================================================
-
-	if err := configureTUN(
-		tun.Name(),
-		ClientIP,
-		GatewayIP,
-	); err != nil {
-		log.Fatal(err)
-	}
-
-	// ============================================================
-	// 5. 自动配置公司网段路由
-	// ============================================================
-
-	if err := configureRoute(
-		VPNNetwork,
-		GatewayIP,
-	); err != nil {
-		log.Fatal(err)
-	}
-
-	// ============================================================
-	// 6. TUN -> UDP
+	// 5. TUN -> UDP
 	// ============================================================
 
 	go tunToUDP(
@@ -149,7 +113,7 @@ func main() {
 	)
 
 	// ============================================================
-	// 7. UDP -> TUN
+	// 6. UDP -> TUN
 	// ============================================================
 
 	udpToTUN(
@@ -159,47 +123,57 @@ func main() {
 }
 
 // ============================================================
-// AUTH
+// GATEWAY AUTH
 //
-// Client:
+// Gateway:
 //
-//     AUTH + Token
+//     GATEWAY_AUTH + JSON
 //
 // Center:
 //
-//     AUTH_OK
-//     SessionID
-//     VPN IP
+//     GATEWAY_AUTH_OK
 //
 // ============================================================
 
 func authenticate(conn *net.UDPConn) error {
 
-	fmt.Println("Authenticating...")
+	fmt.Println("Authenticating gateway...")
 
-	// ============================================================
-	// 构造 AUTH
-	// ============================================================
+	auth := &protocol.GatewayAuth{
+		GatewayID: GatewayID,
+		Token:     AuthToken,
+		Networks: []string{
+			Networks,
+		},
+	}
 
-	authPacket := protocol.Pack(
-		protocol.TypeAuth,
-		0,
-		0,
-		[]byte(AuthToken),
-	)
-
-	_, err := conn.Write(authPacket)
+	payload, err := protocol.MarshalGatewayAuth(auth)
 	if err != nil {
 		return fmt.Errorf(
-			"send AUTH failed: %w",
+			"marshal gateway auth failed: %w",
 			err,
 		)
 	}
 
-	fmt.Println("AUTH sent")
+	authPacket := protocol.Pack(
+		protocol.TypeGatewayAuth,
+		0,
+		0,
+		payload,
+	)
+
+	_, err = conn.Write(authPacket)
+	if err != nil {
+		return fmt.Errorf(
+			"send GATEWAY_AUTH failed: %w",
+			err,
+		)
+	}
+
+	fmt.Println("GATEWAY_AUTH sent")
 
 	// ============================================================
-	// 等待 AUTH_OK
+	// 等待 GATEWAY_AUTH_OK
 	// ============================================================
 
 	buf := make(
@@ -220,7 +194,7 @@ func authenticate(conn *net.UDPConn) error {
 	n, err := conn.Read(buf)
 	if err != nil {
 		return fmt.Errorf(
-			"read AUTH response failed: %w",
+			"read GATEWAY_AUTH response failed: %w",
 			err,
 		)
 	}
@@ -230,56 +204,26 @@ func authenticate(conn *net.UDPConn) error {
 	)
 	if err != nil {
 		return fmt.Errorf(
-			"invalid AUTH response: %w",
+			"invalid GATEWAY_AUTH response: %w",
 			err,
 		)
 	}
 
-	// ============================================================
-	// AUTH FAIL
-	// ============================================================
-
-	if header.Type == protocol.TypeAuthFail {
+	if header.Type == protocol.TypeGatewayAuthFail {
 
 		return fmt.Errorf(
-			"center rejected authentication: %s",
+			"center rejected gateway authentication: %s",
 			string(payload),
 		)
 	}
 
-	// ============================================================
-	// AUTH OK
-	// ============================================================
-
-	if header.Type != protocol.TypeAuthOK {
+	if header.Type != protocol.TypeGatewayAuthOK {
 
 		return fmt.Errorf(
-			"unexpected AUTH response type: %d",
+			"unexpected GATEWAY_AUTH response type: %d",
 			header.Type,
 		)
 	}
-
-	// AUTH_OK payload:
-	//
-	// 4 bytes:
-	//
-	//     VPN IPv4
-	//
-
-	if len(payload) != 4 {
-		return fmt.Errorf(
-			"invalid AUTH_OK payload length: %d",
-			len(payload),
-		)
-	}
-
-	// SessionID
-	SessionID = header.SessionID
-
-	// VPN IP
-	ClientIP = net.IP(
-		payload,
-	).String()
 
 	// 恢复正常读取
 	if err := conn.SetReadDeadline(
@@ -293,19 +237,15 @@ func authenticate(conn *net.UDPConn) error {
 
 	fmt.Println()
 	fmt.Println("==============================")
-	fmt.Println("VPN authentication successful")
+	fmt.Println("Gateway authentication successful")
 	fmt.Println("==============================")
 	fmt.Println(
-		"SessionID:",
-		SessionID,
+		"GatewayID:",
+		GatewayID,
 	)
 	fmt.Println(
-		"VPN IP:",
-		ClientIP,
-	)
-	fmt.Println(
-		"Gateway IP:",
-		GatewayIP,
+		"Networks:",
+		Networks,
 	)
 	fmt.Println()
 
@@ -347,10 +287,6 @@ func tunToUDP(
 
 		packet := buf[:n]
 
-		// ========================================================
-		// 简单检查 IPv4
-		// ========================================================
-
 		if len(packet) < 20 {
 			log.Println(
 				"TUN packet too small:",
@@ -368,12 +304,11 @@ func tunToUDP(
 		)
 
 		fmt.Printf(
-			"TUN -> UDP: %s -> %s, protocol=%d, len=%d, session=%d\n",
+			"TUN -> UDP: %s -> %s, protocol=%d, len=%d\n",
 			srcIP,
 			dstIP,
 			packet[9],
 			len(packet),
-			SessionID,
 		)
 
 		// ========================================================
@@ -382,7 +317,7 @@ func tunToUDP(
 
 		vpnPacket := protocol.Pack(
 			protocol.TypeIP,
-			SessionID,
+			0,
 			0,
 			packet,
 		)
@@ -394,7 +329,6 @@ func tunToUDP(
 		_, err = conn.Write(
 			vpnPacket,
 		)
-
 		if err != nil {
 			log.Println(
 				"UDP write error:",
@@ -449,10 +383,6 @@ func udpToTUN(
 			continue
 		}
 
-		// ========================================================
-		// 检查类型
-		// ========================================================
-
 		if header.Type != protocol.TypeIP {
 
 			fmt.Printf(
@@ -462,25 +392,6 @@ func udpToTUN(
 
 			continue
 		}
-
-		// ========================================================
-		// 检查 SessionID
-		// ========================================================
-
-		if header.SessionID != SessionID {
-
-			fmt.Printf(
-				"ignore packet: session=%d, expected=%d\n",
-				header.SessionID,
-				SessionID,
-			)
-
-			continue
-		}
-
-		// ========================================================
-		// 检查 IP Packet
-		// ========================================================
 
 		if len(packet) < 20 {
 
@@ -501,16 +412,15 @@ func udpToTUN(
 		)
 
 		fmt.Printf(
-			"UDP -> TUN: %s -> %s, protocol=%d, len=%d, session=%d\n",
+			"UDP -> TUN: %s -> %s, protocol=%d, len=%d\n",
 			srcIP,
 			dstIP,
 			packet[9],
 			len(packet),
-			header.SessionID,
 		)
 
 		// ========================================================
-		// 写入 TUN
+		// 写入 TUN，由内核送入公司内网
 		// ========================================================
 
 		_, err = tun.Write(packet)
@@ -525,150 +435,68 @@ func udpToTUN(
 
 // ============================================================
 // 配置 TUN
+//
+// Linux:
+//
+//     ip addr flush dev tun0
+//     ip addr add 10.10.0.2/24 dev tun0
+//     ip link set dev tun0 up
+//
 // ============================================================
 
-func configureTUN(
-	tunName string,
-	clientIP string,
-	gatewayIP string,
-) error {
+func configureTUN(name string) error {
 
-	fmt.Printf(
-		"Configuring TUN %s...\n",
-		tunName,
-	)
+	// 删除旧配置
+	_ = exec.Command(
+		"ip",
+		"addr",
+		"flush",
+		"dev",
+		name,
+	).Run()
 
-	// ============================================================
-	// macOS
-	//
-	// ifconfig utun4 10.10.0.10 10.10.0.2
-	// ============================================================
-
+	// 10.10.0.2/24
 	cmd := exec.Command(
-		"ifconfig",
-		tunName,
-		clientIP,
-		gatewayIP,
+		"ip",
+		"addr",
+		"add",
+		TUNIP+"/"+TUNMask,
+		"dev",
+		name,
 	)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-
 		return fmt.Errorf(
-			"configure TUN failed: %v: %s",
+			"configure IP failed: %v: %s",
 			err,
-			strings.TrimSpace(
-				string(output),
-			),
+			strings.TrimSpace(string(output)),
 		)
 	}
 
-	fmt.Printf(
-		"TUN configured: %s -> %s -> %s\n",
-		tunName,
-		clientIP,
-		gatewayIP,
-	)
-
-	return nil
-}
-
-// ============================================================
-// 配置公司网段路由
-// ============================================================
-
-func configureRoute(
-	vpnNetwork string,
-	gatewayIP string,
-) error {
-
-	fmt.Printf(
-		"Configuring route %s via %s...\n",
-		vpnNetwork,
-		gatewayIP,
-	)
-
-	// ============================================================
-	// macOS
-	//
-	// 先删除旧路由
-	//
-	// route delete -net 192.168.0.0/24
-	// ============================================================
-
-	fmt.Println(
-		"Deleting old route if exists...",
-	)
-
-	delCmd := exec.Command(
-		"route",
-		"delete",
-		"-net",
-		vpnNetwork,
-	)
-
-	output, err := delCmd.CombinedOutput()
-
-	if err != nil {
-
-		// 路由不存在属于正常情况
-		fmt.Printf(
-			"Delete route result: %s\n",
-			strings.TrimSpace(
-				string(output),
-			),
-		)
-	} else {
-
-		fmt.Println(
-			"Old route deleted.",
-		)
-	}
-
-	// ============================================================
-	// 添加新路由
-	//
-	// route add -net 192.168.0.0/24 10.10.0.2
-	// ============================================================
-
-	cmd := exec.Command(
-		"route",
-		"add",
-		"-net",
-		vpnNetwork,
-		gatewayIP,
+	// UP
+	cmd = exec.Command(
+		"ip",
+		"link",
+		"set",
+		"dev",
+		name,
+		"up",
 	)
 
 	output, err = cmd.CombinedOutput()
-
 	if err != nil {
-
-		// 已经存在也可以忽略
-		if strings.Contains(
-			string(output),
-			"File exists",
-		) {
-
-			fmt.Println(
-				"Route already exists.",
-			)
-
-			return nil
-		}
-
 		return fmt.Errorf(
-			"add route failed: %v: %s",
+			"bring TUN up failed: %v: %s",
 			err,
-			strings.TrimSpace(
-				string(output),
-			),
+			strings.TrimSpace(string(output)),
 		)
 	}
 
 	fmt.Printf(
-		"Route added: %s -> %s\n",
-		vpnNetwork,
-		gatewayIP,
+		"TUN configured: %s/%s\n",
+		TUNIP,
+		TUNMask,
 	)
 
 	return nil

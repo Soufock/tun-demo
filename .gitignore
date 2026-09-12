@@ -1,6 +1,7 @@
 # 可执行文件
 client/tun-demo
-server/server
+center/center
+gateway/gateway
 
 # IDE
 .idea/
