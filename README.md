@@ -32,15 +32,33 @@
 
 ```
 ├── protocol/   # 三端共用的 VPN 协议（Pack/Unpack/包类型）
-├── client/     # VPN 客户端（macOS）
-├── center/     # 中继服务器（公网，纯 UDP，不创建 TUN）
+├── client/     # VPN 客户端（macOS / Linux / Windows）
+│   ├── main.go         # 跨平台主逻辑
+│   ├── tun_darwin.go   # macOS：ifconfig + route
+│   ├── tun_linux.go    # Linux：ip addr + ip route
+│   └── tun_windows.go  # Windows：netsh + route
+├── center/     # 中继服务器（公网，纯 UDP，不创建 TUN，天然跨平台）
 │   ├── main.go    # 配置与入口
 │   ├── client/    # ClientManager：Client 认证、Session、VPN IP 地址池
 │   ├── gateway/   # GatewayManager：Gateway 注册与查找
 │   ├── route/     # RouteTable：网段 -> Gateway 路由
 │   └── relay/     # Center：收包分发、认证处理、IP 双向转发
-└── gateway/    # 内网网关（Linux，TUN + 路由）
+└── gateway/    # 内网网关（macOS / Linux / Windows）
+    ├── main.go         # 跨平台主逻辑
+    ├── tun_linux.go    # Linux：ip addr
+    ├── tun_darwin.go   # macOS：ifconfig + interface 路由
+    └── tun_windows.go  # Windows：netsh
 ```
+
+## 平台支持
+
+| 组件   | macOS | Linux | Windows | 说明                                  |
+| ------ | ----- | ----- | ------- | ------------------------------------- |
+| center | ✅    | ✅    | ✅      | 纯 UDP，无平台相关代码                |
+| gateway| ✅    | ✅    | ✅      | TUN 配置按 build tag 分平台实现       |
+| client | ✅    | ✅    | ✅      | 同上                                  |
+
+> **Windows 前置条件**：依赖 [songgao/water](https://github.com/songgao/water)，Windows 上需要安装 TAP-Windows 驱动（tap-windows6，OpenVPN 安装包附带）；配置 IP 和路由需要以管理员权限运行。
 
 ## 自定义协议
 
@@ -88,9 +106,9 @@ Center 地址、Token、Gateway 网段等均为各端 `main.go` 顶部的常量�
 
 ## 运行
 
-三端都需要 root 权限（Center 除外，它不创建 TUN）。
+Client 和 Gateway 需要 root / 管理员权限（创建 TUN 设备、配置 IP 和路由）；Center 是纯 UDP 服务，普通权限即可。
 
-### Center（公网服务器）
+### Center（公网服务器，任意平台）
 
 ```bash
 cd center
@@ -98,7 +116,7 @@ go build -o center .
 ./center
 ```
 
-### Gateway（公司内网 Linux 机器）
+### Gateway（公司内网机器）
 
 ```bash
 cd gateway
@@ -108,7 +126,7 @@ sudo ./gateway
 
 启动后自动创建 TUN（10.10.0.2/24）并向 Center 注册内网网段。注意公司内网需要有回程路由：`10.10.0.0/24 via <Gateway 内网 IP>`。
 
-### Client（macOS）
+### Client（用户电脑）
 
 ```bash
 cd client
@@ -117,6 +135,14 @@ sudo ./tun-demo
 ```
 
 启动后自动创建 TUN、认证获取 VPN IP、配置路由，之后访问公司网段（默认 `192.168.0.0/24`）的流量即通过 `Client → Center → Gateway` 隧道转发。
+
+### 交叉编译
+
+```bash
+GOOS=linux   GOARCH=amd64 go build ./...
+GOOS=darwin  GOARCH=arm64 go build ./...
+GOOS=windows GOARCH=amd64 go build ./...
+```
 
 ## 测试
 

@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os/exec"
-	"strings"
 	"time"
 
 	"github.com/songgao/water"
@@ -434,70 +432,18 @@ func udpToTUN(
 }
 
 // ============================================================
-// 配置 TUN
+// 平台相关接口
 //
-// Linux:
+// configureTUN 由各平台文件实现：
 //
-//     ip addr flush dev tun0
-//     ip addr add 10.10.0.2/24 dev tun0
-//     ip link set dev tun0 up
+//     configureTUN(name string) error
+//
+//     name: TUN 设备名（Linux 为 tun0，macOS 为 utunX，Windows 为适配器名）
+//
+// 各平台实现：
+//
+//     tun_linux.go    - Linux（ip addr / ip link）
+//     tun_darwin.go   - macOS（ifconfig 点对点 + route）
+//     tun_windows.go  - Windows（netsh，依赖 TAP-Windows 驱动）
 //
 // ============================================================
-
-func configureTUN(name string) error {
-
-	// 删除旧配置
-	_ = exec.Command(
-		"ip",
-		"addr",
-		"flush",
-		"dev",
-		name,
-	).Run()
-
-	// 10.10.0.2/24
-	cmd := exec.Command(
-		"ip",
-		"addr",
-		"add",
-		TUNIP+"/"+TUNMask,
-		"dev",
-		name,
-	)
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf(
-			"configure IP failed: %v: %s",
-			err,
-			strings.TrimSpace(string(output)),
-		)
-	}
-
-	// UP
-	cmd = exec.Command(
-		"ip",
-		"link",
-		"set",
-		"dev",
-		name,
-		"up",
-	)
-
-	output, err = cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf(
-			"bring TUN up failed: %v: %s",
-			err,
-			strings.TrimSpace(string(output)),
-		)
-	}
-
-	fmt.Printf(
-		"TUN configured: %s/%s\n",
-		TUNIP,
-		TUNMask,
-	)
-
-	return nil
-}

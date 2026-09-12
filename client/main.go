@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os/exec"
-	"strings"
 	"time"
 
 	"github.com/songgao/water"
@@ -524,152 +522,27 @@ func udpToTUN(
 }
 
 // ============================================================
-// 配置 TUN
+// 平台相关接口
+//
+// 以下两个函数由各平台文件实现：
+//
+//     tun_darwin.go   - macOS（ifconfig / route）
+//     tun_linux.go    - Linux（ip addr / ip route）
+//     tun_windows.go  - Windows（netsh / route，依赖 TAP-Windows 驱动）
+//
+// configureTUN 配置 TUN 设备 IP：
+//
+//     configureTUN(tunName, clientIP, peerIP string) error
+//
+//     tunName:  TUN 设备名（macOS 为 utunX，Linux 为 tun0，Windows 为适配器名）
+//     clientIP: Center 分配的 VPN IP
+//     peerIP:   对端（Gateway TUN）地址，点对点平台使用
+//
+// configureRoute 配置公司网段路由：
+//
+//     configureRoute(network, gatewayIP string) error
+//
+//     network:   公司网段 CIDR，例如 192.168.0.0/24
+//     gatewayIP: 下一跳（Gateway TUN 地址）
+//
 // ============================================================
-
-func configureTUN(
-	tunName string,
-	clientIP string,
-	gatewayIP string,
-) error {
-
-	fmt.Printf(
-		"Configuring TUN %s...\n",
-		tunName,
-	)
-
-	// ============================================================
-	// macOS
-	//
-	// ifconfig utun4 10.10.0.10 10.10.0.2
-	// ============================================================
-
-	cmd := exec.Command(
-		"ifconfig",
-		tunName,
-		clientIP,
-		gatewayIP,
-	)
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-
-		return fmt.Errorf(
-			"configure TUN failed: %v: %s",
-			err,
-			strings.TrimSpace(
-				string(output),
-			),
-		)
-	}
-
-	fmt.Printf(
-		"TUN configured: %s -> %s -> %s\n",
-		tunName,
-		clientIP,
-		gatewayIP,
-	)
-
-	return nil
-}
-
-// ============================================================
-// 配置公司网段路由
-// ============================================================
-
-func configureRoute(
-	vpnNetwork string,
-	gatewayIP string,
-) error {
-
-	fmt.Printf(
-		"Configuring route %s via %s...\n",
-		vpnNetwork,
-		gatewayIP,
-	)
-
-	// ============================================================
-	// macOS
-	//
-	// 先删除旧路由
-	//
-	// route delete -net 192.168.0.0/24
-	// ============================================================
-
-	fmt.Println(
-		"Deleting old route if exists...",
-	)
-
-	delCmd := exec.Command(
-		"route",
-		"delete",
-		"-net",
-		vpnNetwork,
-	)
-
-	output, err := delCmd.CombinedOutput()
-
-	if err != nil {
-
-		// 路由不存在属于正常情况
-		fmt.Printf(
-			"Delete route result: %s\n",
-			strings.TrimSpace(
-				string(output),
-			),
-		)
-	} else {
-
-		fmt.Println(
-			"Old route deleted.",
-		)
-	}
-
-	// ============================================================
-	// 添加新路由
-	//
-	// route add -net 192.168.0.0/24 10.10.0.2
-	// ============================================================
-
-	cmd := exec.Command(
-		"route",
-		"add",
-		"-net",
-		vpnNetwork,
-		gatewayIP,
-	)
-
-	output, err = cmd.CombinedOutput()
-
-	if err != nil {
-
-		// 已经存在也可以忽略
-		if strings.Contains(
-			string(output),
-			"File exists",
-		) {
-
-			fmt.Println(
-				"Route already exists.",
-			)
-
-			return nil
-		}
-
-		return fmt.Errorf(
-			"add route failed: %v: %s",
-			err,
-			strings.TrimSpace(
-				string(output),
-			),
-		)
-	}
-
-	fmt.Printf(
-		"Route added: %s -> %s\n",
-		vpnNetwork,
-		gatewayIP,
-	)
-
-	return nil
-}
